@@ -21,20 +21,30 @@ if (-not (Test-Path $dotnet)) {
     $dotnet = "dotnet"
 }
 
-$requiredSdk = (Get-Content (Join-Path $repoRoot "global.json") -Raw | ConvertFrom-Json).sdk.version
+$globalJsonContent = Get-Content (Join-Path $repoRoot "global.json") -Raw | ConvertFrom-Json
+$requiredSdk = $globalJsonContent.sdk.version
 try {
     $versionOutput = & $dotnet --version 2>&1
     if ($LASTEXITCODE -ne 0) { throw "dotnet host returned exit code $LASTEXITCODE" }
 } catch {
     throw "Required .NET SDK $requiredSdk is not executable at '$dotnet': $($_.Exception.Message)"
 }
+$rollForward = if ($globalJsonContent.sdk.rollForward) { [string]$globalJsonContent.sdk.rollForward } else { "latestPatch" }
 $requiredParts = [string]$requiredSdk -split '\.'
-$actualParts = [string]$versionOutput -split '\.'
-$compatibleFeatureBand = $requiredParts.Length -ge 3 -and $actualParts.Length -ge 3 -and
-    $requiredParts[0] -eq $actualParts[0] -and $requiredParts[1] -eq $actualParts[1] -and
-    $requiredParts[2].Substring(0, 2) -eq $actualParts[2].Substring(0, 2)
-if (-not $compatibleFeatureBand) {
-    throw "Required .NET SDK feature band $requiredSdk, found '$versionOutput' at '$dotnet'"
+$actualParts = ([string]$versionOutput).Trim() -split '\.'
+$compatible = $false
+switch ($rollForward) {
+    "latestMajor" { $compatible = $true }
+    "latestMinor" { $compatible = ($requiredParts[0] -eq $actualParts[0]) }
+    "latestFeature" { $compatible = ($requiredParts[0] -eq $actualParts[0] -and $requiredParts[1] -eq $actualParts[1]) }
+    default {
+        $compatible = $requiredParts.Length -ge 3 -and $actualParts.Length -ge 3 -and
+            $requiredParts[0] -eq $actualParts[0] -and $requiredParts[1] -eq $actualParts[1] -and
+            $requiredParts[2].Substring(0, 2) -eq $actualParts[2].Substring(0, 2)
+    }
+}
+if (-not $compatible) {
+    throw "Required .NET SDK $requiredSdk (rollForward: $rollForward), found '$versionOutput' at '$dotnet'"
 }
 
 $project = Join-Path $PSScriptRoot "SmsWorkbench.csproj"

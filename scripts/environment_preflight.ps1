@@ -29,14 +29,23 @@ if (-not $dotnet) {
     throw "No executable .NET host found; required SDK is $requiredSdk"
 }
 
+$rollForward = if ($globalJson.sdk.rollForward) { [string]$globalJson.sdk.rollForward } else { "latestPatch" }
 $requiredParts = $requiredSdk -split '\.'
-$actualParts = $version -split '\.'
-$compatibleFeatureBand = $requiredParts.Length -ge 3 -and $actualParts.Length -ge 3 -and
-    $requiredParts[0] -eq $actualParts[0] -and
-    $requiredParts[1] -eq $actualParts[1] -and
-    $requiredParts[2].Substring(0, 2) -eq $actualParts[2].Substring(0, 2)
-if (-not $compatibleFeatureBand) {
-    throw "Required .NET SDK feature band $requiredSdk, found $version at $dotnet"
+$actualParts = ([string]$version).Trim() -split '\.'
+$compatible = $false
+switch ($rollForward) {
+    "latestMajor" { $compatible = $true }
+    "latestMinor" { $compatible = ($requiredParts[0] -eq $actualParts[0]) }
+    "latestFeature" { $compatible = ($requiredParts[0] -eq $actualParts[0] -and $requiredParts[1] -eq $actualParts[1]) }
+    default {
+        $compatible = $requiredParts.Length -ge 3 -and $actualParts.Length -ge 3 -and
+            $requiredParts[0] -eq $actualParts[0] -and
+            $requiredParts[1] -eq $actualParts[1] -and
+            $requiredParts[2].Substring(0, 2) -eq $actualParts[2].Substring(0, 2)
+    }
+}
+if (-not $compatible) {
+    throw "Required .NET SDK $requiredSdk (rollForward: $rollForward), found $version at $dotnet"
 }
 
 $installed = @(& $dotnet --list-sdks 2>&1)
