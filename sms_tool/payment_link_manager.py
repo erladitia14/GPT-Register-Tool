@@ -1,0 +1,1172 @@
+"""Unified state machine for protocol payment-link extraction.
+
+Native PayPal/UPI flows stay in :mod:`sms_tool.gen_pp_link`; GoPay and GrabPay
+use the shared wallet provider, while GCash owns its custom-payment-method
+adapter; iDEAL/PIX/Kakao Pay/BLIK/TWINT run the
+vendored protocol extractors under ``services/protocol-payment``.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable, Mapping
+
+from .config import current_config_data, resolve_runtime_config, validate_config
+from .paths import project_path, runtime_file
+from .payment_contracts import PaymentRequest, PaymentResult
+from .payment_catalog import PAYMENT_METHODS as CATALOG_METHODS, normalize_payment_method as normalize_catalog_payment_method
+from .payment_adapters import FunctionPaymentAdapter, PaymentAdapterRegistry
+from .sanitizer import sanitize as _canonical_sanitize, sanitize_text as _canonical_sanitize_text
+
+
+# Deprecated monkeypatch hook. Production callers inject RuntimeConfig or use
+# the current application scope.
+CFG: dict[str, Any] = {}
+
+
+def _config_data(runtime_config: Mapping[str, Any] | None = None) -> Mapping[str, Any]:
+    if runtime_config is not None:
+        return resolve_runtime_config(runtime_config).data
+    if CFG:
+        merged = dict(current_config_data())
+        merged.update(CFG)
+        return merged
+    return current_config_data()
+
+
+@dataclass(frozen=True)
+class PaymentMethodSpec:
+    key: str
+    label: str
+    country: str
+    currency: str
+    adapter: str
+    script: str = ""
+
+
+PAYMENT_METHODS = {
+    key: PaymentMethodSpec(
+        key,
+        definition.label,
+        definition.country,
+        definition.currency,
+        {"native_paypal": "native", "native_upi": "native"}.get(definition.adapter, definition.adapter),
+        definition.script,
+    )
+    for key, definition in CATALOG_METHODS.items()
+}
+
+_TERMINAL_STATES = frozenset({"completed", "failed", "cancelled", "unknown", "timed_out"})
+_NON_SUCCESS_TERMINAL_STATES = _TERMINAL_STATES - {"completed"}
+_TRANSITIONS = {
+    "created": {"validating"} | _NON_SUCCESS_TERMINAL_STATES,
+    "validating": {"preparing_proxy"} | _NON_SUCCESS_TERMINAL_STATES,
+    "preparing_proxy": {"running"} | _NON_SUCCESS_TERMINAL_STATES,
+    "running": {"extracting"} | _NON_SUCCESS_TERMINAL_STATES,
+    "extracting": set(_TERMINAL_STATES),
+    **{state: set() for state in _TERMINAL_STATES},
+}
+
+_STATE_LOCK = threading.Lock()
+_URL_RE = re.compile(r"(?:https?://|upi://)[^\s\"'<>]+", re.IGNORECASE)
+_RESULT_URL_RE = re.compile(
+    r"(?im)^(?:iDEAL 最终扫码/授权 URL|Kakao/Nicepay 最终跳转 URL|"
+    r"TWINT 最终支付 URL|BLIK 支付页 URL):\s*(?:\r?\n)?"
+    r"((?:https?://|upi://)[^\s\"'<>]+)"
+)
+_BLIK_RESULT_RE = re.compile(r"BLIK_RESULT:(\{.*\})")
+_BA_TOKEN_RE = re.compile(r"BA-[A-Za-z0-9_.-]+")
+_BEARER_RE = re.compile(r"(?i)(\bBearer\s+)[A-Za-z0-9._~+/=-]+")
+_JWT_RE = re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}\b")
+_PROXY_AUTH_RE = re.compile(r"(?i)\b(https?|socks5h?)://[^\s/@]+@")
+_SENSITIVE_VALUE_RE = re.compile(
+    r"(?i)(\b(?:access[_-]?token|refresh[_-]?token|id[_-]?token|api[_-]?key|"
+    r"client[_-]?secret|password|blik[_-]?code)\b[\"']?\s*[:=]\s*[\"']?)([^\s\"'&,}]+)"
+)
+
+def build_default_payment_registry() -> PaymentAdapterRegistry:
+    """Build and validate the complete adapter composition for the catalog."""
+    registry = PaymentAdapterRegistry()
+
+    def methods_for(adapter_key: str) -> tuple[str, ...]:
+        return tuple(
+            key for key, definition in CATALOG_METHODS.items()
+            if definition.adapter == adapter_key
+        )
+
+    def paypal_runner(*, access_token: str, proxy: Any = None, auth_context: Mapping[str, Any] | None = None, **kwargs: Any) -> dict[str, Any]:
+        from .gen_pp_link import generate_pp_link
+        runtime_config = kwargs.pop("runtime_config", None)
+        kwargs.pop("payment_method", None)
+        return generate_pp_link(
+            access_token=access_token,
+            proxy=proxy,
+            auth_context=auth_context,
+            paypal_generation_type=kwargs.pop("paypal_generation_type", None),
+            runtime_config=runtime_config,
+            **_select_kwargs(kwargs, {
+                "checkout_proxy", "provider_proxy", "stripe_init_proxy", "payment_method_proxy",
+                "confirm_proxy", "approve_proxy", "promotion_proxy", "target_country",
+                "checkout_country", "require_zero", "require_ba_token", "stage_proxy_countries",
+            }),
+        )
+
+    def upi_runner(*, access_token: str, proxy: Any = None, auth_context: Mapping[str, Any] | None = None, **kwargs: Any) -> dict[str, Any]:
+        from .gen_pp_link import generate_upi_qr_link
+        runtime_config = kwargs.pop("runtime_config", None)
+        kwargs.pop("payment_method", None)
+        return generate_upi_qr_link(
+            access_token=access_token,
+            proxy=proxy,
+            auth_context=auth_context,
+            runtime_config=runtime_config,
+            **_select_kwargs(kwargs, {
+                "checkout_proxy", "provider_proxy", "approve_proxy", "target_country",
+                "checkout_country", "payment_country", "require_zero", "qr_path",
+            }),
+        )
+
+    def wallet_runner(*, access_token: str, proxy: Any = None, auth_context: Mapping[str, Any] | None = None, **kwargs: Any) -> dict[str, Any]:
+        return _run_wallet_adapter(PAYMENT_METHODS[str(kwargs.pop("payment_method"))], access_token, proxy=proxy, auth_context=auth_context, **kwargs)
+
+    def gcash_runner(*, access_token: str, proxy: Any = None, auth_context: Mapping[str, Any] | None = None, **kwargs: Any) -> dict[str, Any]:
+        kwargs.pop("payment_method", None)
+        return _run_gcash_adapter(PAYMENT_METHODS["gcash"], access_token, proxy=proxy, auth_context=auth_context, **kwargs)
+
+    def script_runner(*, access_token: str, proxy: Any = None, auth_context: Mapping[str, Any] | None = None, **kwargs: Any) -> dict[str, Any]:
+        spec = PAYMENT_METHODS[str(kwargs.pop("payment_method"))]
+        return _run_protocol_script(spec, access_token, proxy=proxy, **kwargs)
+
+    def direct_runner(*, access_token: str, proxy: Any = None, auth_context: Mapping[str, Any] | None = None, **kwargs: Any) -> dict[str, Any]:
+        return _run_direct_card(PAYMENT_METHODS["direct_card"], access_token, proxy=proxy, **kwargs)
+
+    def momo_runner(*, access_token: str, proxy: Any = None, auth_context: Mapping[str, Any] | None = None, **kwargs: Any) -> dict[str, Any]:
+        return _run_momo(PAYMENT_METHODS["momo"], access_token, proxy=proxy, **kwargs)
+
+    registry.register(FunctionPaymentAdapter("native_paypal", methods_for("native_paypal"), paypal_runner))
+    registry.register(FunctionPaymentAdapter("native_upi", methods_for("native_upi"), upi_runner))
+    registry.register(FunctionPaymentAdapter("wallet", methods_for("wallet"), wallet_runner))
+    registry.register(FunctionPaymentAdapter("gcash_custom", methods_for("gcash_custom"), gcash_runner))
+    registry.register(FunctionPaymentAdapter("script", methods_for("script"), script_runner))
+    registry.register(FunctionPaymentAdapter("direct_card", methods_for("direct_card"), direct_runner))
+    registry.register(FunctionPaymentAdapter("momo", methods_for("momo"), momo_runner))
+    registry.validate_methods(set(PAYMENT_METHODS))
+    return registry
+
+
+PAYMENT_ADAPTERS = build_default_payment_registry()
+
+
+class PaymentLinkRun:
+    def __init__(self, method: str):
+        self.run_id = uuid.uuid4().hex
+        self.method = method
+        self.state = "created"
+        self.history: list[dict[str, Any]] = []
+        self._record("created", "Tugas telah dibuat")
+
+    def move(self, state: str, message: str = "") -> None:
+        allowed = _TRANSITIONS.get(self.state, set())
+        if state not in allowed:
+            raise RuntimeError(f"invalid payment state transition: {self.state} -> {state}")
+        self.state = state
+        self._record(state, message)
+
+    def fail(self, message: str) -> None:
+        self.terminate("failed", message)
+
+    def terminate(self, state: str, message: str) -> None:
+        if state not in _TERMINAL_STATES:
+            raise ValueError(f"not a terminal payment state: {state}")
+        if self.state not in _TERMINAL_STATES:
+            self.move(state, message)
+
+    def _record(self, state: str, message: str) -> None:
+        self.history.append({"state": state, "at": int(time.time()), "message": message})
+
+
+def normalize_payment_method(value: Any) -> str:
+    method = normalize_catalog_payment_method(value)
+    return method if method in PAYMENT_METHODS else ""
+
+
+def payment_method_label(value: Any) -> str:
+    method = normalize_payment_method(value)
+    return PAYMENT_METHODS[method].label if method else str(value or "")
+
+
+def supported_payment_methods() -> list[dict[str, Any]]:
+    root = _reference_root()
+    output = []
+    for spec in PAYMENT_METHODS.values():
+        available = spec.adapter in {"native", "wallet"} or (root / spec.script).is_file()
+        output.append({
+            "key": spec.key,
+            "label": spec.label,
+            "country": spec.country,
+            "currency": spec.currency,
+            "adapter": spec.adapter,
+            "available": available,
+        })
+    return output
+
+
+def register_payment_adapter(adapter: Any) -> Any:
+    """Register an adapter at the payment seam; useful for new methods/tests."""
+    PAYMENT_ADAPTERS.register(adapter)
+    return adapter
+
+
+def generate_payment_link(
+    access_token: str,
+    proxy: Any = None,
+    payment_method: Any = "paypal",
+    auth_context: dict[str, Any] | None = None,
+    paypal_generation_type: str | None = None,
+    progress: Callable[[dict[str, Any]], None] | None = None,
+    runtime_config: Mapping[str, Any] | None = None,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    runtime_config = _config_data(runtime_config)
+    validate_config(runtime_config, workflow="protocol_payments")
+    method = normalize_payment_method(payment_method)
+    run = PaymentLinkRun(method or str(payment_method or ""))
+
+    def move(state: str, message: str) -> None:
+        run.move(state, message)
+        if progress:
+            progress(dict(run.history[-1], run_id=run.run_id, method=run.method))
+
+    try:
+        move("validating", "Validasi metode pembayaran dan Access Token")
+        if not method:
+            raise ValueError(f"unsupported payment method: {payment_method}")
+        if not str(access_token or "").strip():
+            raise ValueError("access_token is required")
+        spec = PAYMENT_METHODS[method]
+        enabled = _enabled_methods(runtime_config)
+        if method not in enabled:
+            raise ValueError(f"payment method disabled by protocol_payments.enabled_methods: {method}")
+        move("preparing_proxy", "Memuat agen segmen dan adapter protokol")
+        move("running", f"Eksekusi protokol ekstraksi tautan {spec.label}")
+
+        if bool(kwargs.get("probe_only")):
+            from .payment_capability import payment_method_capability_probe
+
+            result = payment_method_capability_probe(
+                access_token=access_token,
+                payment_method=method,
+                auth_context=auth_context,
+                proxy=proxy,
+                **kwargs,
+            )
+        else:
+            request = PaymentRequest.create(
+                payment_method=method,
+                access_token=access_token,
+                proxy=proxy,
+                auth_context=auth_context,
+                runtime_config=runtime_config,
+                options={**kwargs, "paypal_generation_type": paypal_generation_type},
+            )
+            result = PAYMENT_ADAPTERS.execute(request).to_dict()
+
+        move("extracting", "Normalisasi tautan, kode QR, dan hasil protokol")
+        normalized = _normalize_result(spec, result)
+        if not normalized.get("ok"):
+            terminal_state = _result_terminal_state(normalized)
+            return _finish_run(
+                run,
+                normalized,
+                terminal_state,
+                str(normalized.get("error") or f"{spec.label} extraction failed"),
+            )
+        if normalized.get("operation") == "payment_method_capability_probe":
+            completion_message = "Deteksi kemampuan metode pembayaran selesai"
+        elif normalized.get("operation") == "execute_payment":
+            completion_message = "BLIK Pembayaran Protokol Selesai"
+        else:
+            completion_message = "Ekstraksi tautan pembayaran perjanjian selesai"
+        return _finish_run(run, normalized, "completed", completion_message)
+    except (KeyboardInterrupt, asyncio.CancelledError) as exc:
+        cancelled = {
+            "ok": False,
+            "status": "cancelled",
+            "error": _redact_sensitive_text(str(exc)) or "payment-link extraction cancelled",
+            "error_code": "payment_link_cancelled",
+            "error_stage": _manager_error_stage(run.state),
+            "retryable": False,
+            "payment_method": method or str(payment_method or ""),
+            "url": "",
+        }
+        return _finish_run(run, cancelled, "cancelled", cancelled["error"])
+    except Exception as exc:
+        terminal_state, error_code, retryable = _classify_exception(exc)
+        error = _redact_sensitive_text(str(exc)) or type(exc).__name__
+        failed = {
+            "ok": False,
+            "error": error,
+            "error_code": error_code,
+            "error_stage": str(
+                getattr(exc, "error_stage", "")
+                or getattr(exc, "stage", "")
+                or _manager_error_stage(run.state)
+            ),
+            "retryable": retryable,
+            "payment_method": method or str(payment_method or ""),
+            "url": "",
+        }
+        if terminal_state != "failed":
+            failed["status"] = terminal_state
+        if terminal_state == "unknown":
+            failed["requires_reconciliation"] = True
+        return _finish_run(run, failed, terminal_state, error)
+
+
+def _finish_run(
+    run: PaymentLinkRun,
+    result: dict[str, Any],
+    terminal_state: str,
+    message: str,
+) -> dict[str, Any]:
+    """Attach the common terminal contract and persist one final run record."""
+    run.terminate(terminal_state, message)
+    result = PaymentResult.from_mapping(
+        result,
+        payment_method=run.method,
+        terminal_state=terminal_state,
+    ).to_dict()
+    result.update({
+        "run_id": run.run_id,
+        "manager_state": run.state,
+        "state_history": run.history,
+    })
+    _safe_persist_run(result)
+    return result
+
+
+def _run_extractor_subprocess(
+    spec: PaymentMethodSpec,
+    command: list[str],
+    *,
+    env: dict[str, str],
+    cwd: str,
+    timeout: int,
+    cleanup_paths: tuple[str, ...] = (),
+) -> tuple[subprocess.CompletedProcess[str] | None, str, dict[str, Any] | None]:
+    """Run an extractor CLI, returning ``(proc, combined_output, timeout_error)``.
+
+    Centralizes the run + ``TimeoutExpired`` handling + temp-file cleanup shared by
+    the script/direct_card/momo adapters. On timeout returns ``(None, "", err_dict)``;
+    otherwise ``(proc, stdout+stderr, None)``. ``cleanup_paths`` are always removed.
+    """
+    try:
+        proc = subprocess.run(
+            command,
+            cwd=cwd,
+            env=env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+        )
+        output = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+        return proc, output, None
+    except subprocess.TimeoutExpired:
+        return None, "", {
+            "ok": False,
+            "status": "timed_out",
+            "error": f"{spec.label} extractor timed out after {timeout}s",
+            "error_code": "extractor_timed_out",
+            "error_stage": "adapter_subprocess",
+            "retryable": True,
+        }
+    finally:
+        for path in cleanup_paths:
+            if path:
+                try:
+                    Path(path).unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+
+def _run_protocol_script(spec: PaymentMethodSpec, access_token: str, proxy: Any = None, **kwargs: Any) -> dict[str, Any]:
+    runtime_config = kwargs.pop("runtime_config", None)
+    root = _reference_root(runtime_config)
+    script = root / spec.script
+    if not script.is_file():
+        return {"ok": False, "error": f"protocol extractor not found: {script}"}
+
+    cfg = _protocol_cfg(runtime_config)
+    method_cfg = cfg.get("methods", {}).get(spec.key, {}) if isinstance(cfg.get("methods"), Mapping) else {}
+    if not isinstance(method_cfg, Mapping):
+        method_cfg = {}
+    timeout = int(method_cfg.get("timeout_seconds") or cfg.get("timeout_seconds") or 900)
+    seed_proxy = str(
+        kwargs.get("seed_proxy")
+        or proxy
+        or kwargs.get("provider_proxy")
+        or kwargs.get("checkout_proxy")
+        or method_cfg.get("proxy")
+        or ""
+    ).strip()
+    if not seed_proxy:
+        return {"ok": False, "error": f"{spec.label} requires a proxy seed"}
+    blik_code = str(kwargs.get("blik_code") or "").strip() if spec.key == "blik" else ""
+    if spec.key == "blik" and not re.fullmatch(r"\d{6}", blik_code):
+        return {"ok": False, "error": "BLIK requires an explicit 6-digit code for this run"}
+
+    env = os.environ.copy()
+    env["PYTHONUTF8"] = "1"
+    command = [sys.executable, str(script)]
+    proxy_file = ""
+    if spec.key == "pix":
+        env["OPENAI_ACCESS_TOKEN"] = access_token
+        command.extend(["--quiet", "--proxy", seed_proxy])
+        provider_proxy = str(kwargs.get("provider_proxy") or "").strip()
+        promotion_proxy = str(kwargs.get("promotion_proxy") or "").strip()
+        if provider_proxy:
+            command.extend(["--br-proxy", provider_proxy])
+        if promotion_proxy:
+            command.extend(["--vn-proxy", promotion_proxy])
+    else:
+        handle = tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".txt", delete=False)
+        with handle:
+            handle.write(seed_proxy + "\n")
+        proxy_file = handle.name
+        if spec.key == "ideal":
+            env.update({"PP_TOKEN": access_token, "IDEAL_PROXY_SEED_FILE": proxy_file, "IDEAL_FLOW_MODE": "single"})
+        elif spec.key == "kakao":
+            # Prioritaskan penggunaan file multi-seed khusus Kakao (proxy_seeds.txt) untuk redundansi dan pergantian jika gagal;
+            # Satu seed keluar / TLS masuk dalam jitter saat pendingin masih bisa beralih ke seed berikutnya. Jika tidak ada, mundur ke manajer
+            # proxy stage tunggal yang diteruskan.
+            kakao_seed_pool = script.parent /"proxy_seeds.txt"
+            kakao_seed_file = (
+                str(kakao_seed_pool)
+                if kakao_seed_pool.is_file()
+                and kakao_seed_pool.read_text(encoding="utf-8", errors="ignore").strip()
+                else proxy_file
+            )
+            env.update({"KAKAO_TOKEN": access_token, "KAKAO_PROXY_SEED_FILE": kakao_seed_file})
+            countries = kwargs.get("stage_proxy_countries") if isinstance(kwargs.get("stage_proxy_countries"), dict) else {}
+            checkout_country = str(countries.get("checkout") or kwargs.get("checkout_country") or "KR").strip().upper()
+            promotion_country = str(countries.get("promotion") or "VN").strip().upper()
+            provider_country = str(countries.get("provider") or kwargs.get("target_country") or "KR").strip().upper()
+            env.update({
+                "KAKAO_BOOTSTRAP_COUNTRY": checkout_country,
+                "KAKAO_PROMOTION_COUNTRY": promotion_country,
+                "KAKAO_PROVIDER_COUNTRY": provider_country,
+            })
+        elif spec.key == "blik":
+            env.update({"PP_TOKEN": access_token, "IDEAL_PROXY_SEED_FILE": proxy_file, "IDEAL_FLOW_MODE": "single", "IDEAL_BLIK_CODE": blik_code})
+        elif spec.key == "twint":
+            env.update({"PP_TOKEN": access_token, "TWINT_PROXY_SEED_FILE": proxy_file, "TWINT_FLOW_MODE": "single"})
+
+    proc, output, timeout_err = _run_extractor_subprocess(
+        spec, command, env=env, cwd=str(script.parent), timeout=timeout, cleanup_paths=(proxy_file,),
+    )
+    if timeout_err:
+        return timeout_err
+    parsed = _last_json_object(proc.stdout or "")
+    if (
+        parsed.get("schema") == "protocol_payment.v1"
+        and (proc.returncode == 0 or parsed.get("ok") is False)
+    ):
+        parsed.setdefault("payment_method", spec.key)
+        parsed.setdefault("link_type", f"{spec.key}_protocol")
+        return parsed
+    parsed = parsed if spec.key in {"pix", "kakao"} else {}
+    if parsed and spec.key == "kakao":
+        parsed.setdefault("payment_method", "kakao")
+        parsed.setdefault("url", parsed.get("provider_redirect_url") or "")
+        return parsed
+    if proc.returncode != 0:
+        return {
+            "ok": False,
+            "error": _redact_sensitive_text(_tail(output)) or f"extractor exited {proc.returncode}",
+            "exit_code": proc.returncode,
+        }
+    parsed = _last_json_object(proc.stdout or "") if spec.key == "pix" else {}
+    if parsed:
+        parsed["ok"] = bool(parsed.get("long_url") or parsed.get("provider_redirect_url") or parsed.get("pix_qr_code"))
+        parsed["url"] = parsed.get("long_url") or parsed.get("provider_redirect_url") or parsed.get("pix_hosted_instructions_url") or ""
+        parsed["qr_data"] = parsed.get("pix_qr_code") or ""
+        return parsed
+    if spec.key == "blik":
+        # Mode pembayaran otomatis BLIK tidak memiliki URL yang dapat dibagikan setelah pembayaran berhasil; sinyal keberhasilan adalah yang dicetak oleh ekstraktor
+        # ``BLIK_RESULT:{...}`` pelacak penyelesaian (status=completed). Jangan lagi mengambil URL dari log yang terpotong.
+        completion = _blik_completion(proc.stdout or"")
+        if completion:
+            return {
+                "ok": True,
+                "url": "",
+                "status": "completed",
+                "operation": "execute_payment",
+                "link_type": "blik_protocol_completed",
+                "message": completion.get("message") or "BLIK kirim otomatis selesai",
+            }
+    url = _last_payment_url(output)
+    if not url:
+        return {"ok": False, "error": _redact_sensitive_text(_tail(output)) or "extractor returned no payment URL"}
+    return {"ok": True, "url": url, "link_type": f"{spec.key}_protocol"}
+
+
+_DIRECT_CARD_CURRENCY = {
+    "PH": "PHP", "US": "USD", "GB": "GBP", "JP": "JPY", "DE": "EUR", "FR": "EUR",
+    "IE": "EUR", "NL": "EUR", "AU": "AUD", "CA": "CAD", "SG": "SGD", "IN": "INR",
+    "TR": "TRY", "BR": "BRL", "KR": "KRW", "PL": "PLN", "CH": "CHF", "VN": "VND",
+    "NZ": "NZD",
+}
+
+
+def _write_token_file(access_token: str) -> str:
+    handle = tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".txt", delete=False)
+    with handle:
+        handle.write(str(access_token or "").strip() + "\n")
+    return handle.name
+
+
+def _run_wallet_adapter(
+    spec: PaymentMethodSpec,
+    access_token: str,
+    proxy: Any = None,
+    auth_context: dict[str, Any] | None = None,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    from .wallet_provider import run_wallet_provider
+    from .wallet_transport import ChatGPTStripeWalletTransport
+
+    runtime_config = kwargs.pop("runtime_config", None)
+    cfg = _protocol_cfg(runtime_config)
+    methods = cfg.get("methods") if isinstance(cfg.get("methods"), Mapping) else {}
+    method_cfg = methods.get(spec.key) if isinstance(methods.get(spec.key), Mapping) else {}
+    timeout = max(5, int(kwargs.get("timeout_seconds") or method_cfg.get("timeout_seconds") or 900))
+    stage_keys = (
+        "checkout_proxy", "stripe_init_proxy", "provider_proxy", "payment_method_proxy",
+        "confirm_proxy", "approve_proxy", "redirect_proxy",
+    )
+    transport_context: dict[str, Any] = {
+        key: kwargs.get(key) or method_cfg.get(key) or ""
+        for key in stage_keys
+    }
+    transport_context["default_proxy"] = proxy or method_cfg.get("proxy") or ""
+    billing = kwargs.get("billing_details") or method_cfg.get("billing_details")
+    if not isinstance(billing, dict):
+        billing = None
+    return run_wallet_provider(
+        spec.key,
+        access_token,
+        ChatGPTStripeWalletTransport(timeout=timeout),
+        probe_only=bool(kwargs.get("probe_only")),
+        billing_details=billing,
+        auth_context=auth_context if isinstance(auth_context, dict) else {},
+        transport_context=transport_context,
+        stripe_publishable_key=str(
+            kwargs.get("stripe_publishable_key")
+            or method_cfg.get("stripe_publishable_key")
+            or os.environ.get("PP_STRIPE_PUBLISHABLE_KEY")
+            or ""
+        ).strip(),
+        require_zero=bool(kwargs.get("require_zero", method_cfg.get("require_zero", False))),
+        max_approve_attempts=int(
+            kwargs.get("max_approve_attempts") or method_cfg.get("max_approve_attempts") or 6
+        ),
+        max_poll_attempts=int(kwargs.get("max_poll_attempts") or method_cfg.get("max_poll_attempts") or 25),
+        poll_interval_seconds=float(
+            kwargs.get("poll_interval_seconds") or method_cfg.get("poll_interval_seconds") or 2.0
+        ),
+    )
+
+
+def _run_gcash_adapter(
+    spec: PaymentMethodSpec,
+    access_token: str,
+    proxy: Any = None,
+    auth_context: dict[str, Any] | None = None,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    from .gcash_provider import DEFAULT_GCASH_CUSTOM_PAYMENT_METHOD_ID, run_gcash_provider
+    from .gcash_transport import ChatGPTGCashTransport
+
+    runtime_config = kwargs.pop("runtime_config", None)
+    cfg = _protocol_cfg(runtime_config)
+    methods = cfg.get("methods") if isinstance(cfg.get("methods"), Mapping) else {}
+    method_cfg = methods.get(spec.key) if isinstance(methods.get(spec.key), Mapping) else {}
+    timeout = max(5, int(kwargs.get("timeout_seconds") or method_cfg.get("timeout_seconds") or 900))
+    transport_context: dict[str, Any] = {
+        "checkout_proxy": kwargs.get("checkout_proxy") or method_cfg.get("checkout_proxy") or "",
+        "promotion_proxy": kwargs.get("promotion_proxy") or method_cfg.get("promotion_proxy") or "",
+        "update_proxy": kwargs.get("update_proxy") or method_cfg.get("update_proxy") or "",
+        # The proven GCash route keeps checkout, taxes, resolve and provider start
+        # on one exit. Promotion update may use its own exit.
+        "provider_proxy": (
+            kwargs.get("checkout_proxy") or kwargs.get("provider_proxy")
+            or method_cfg.get("provider_proxy") or ""
+        ),
+        "confirm_proxy": (
+            kwargs.get("confirm_proxy")
+            or kwargs.get("checkout_proxy")
+            or kwargs.get("provider_proxy")
+            or method_cfg.get("confirm_proxy")
+            or kwargs.get("approve_proxy")
+            or ""
+        ),
+    }
+    transport_context["default_proxy"] = proxy or method_cfg.get("proxy") or ""
+    return run_gcash_provider(
+        access_token,
+        ChatGPTGCashTransport(timeout=timeout),
+        probe_only=bool(kwargs.get("probe_only")),
+        auth_context=auth_context if isinstance(auth_context, dict) else {},
+        transport_context=transport_context,
+        custom_payment_method_type_id=str(
+            kwargs.get("custom_payment_method_type_id")
+            or method_cfg.get("custom_payment_method_type_id")
+            or DEFAULT_GCASH_CUSTOM_PAYMENT_METHOD_ID
+        ).strip(),
+        require_zero=bool(kwargs.get("require_zero", method_cfg.get("require_zero", True))),
+    )
+
+
+def _run_direct_card(spec: PaymentMethodSpec, access_token: str, proxy: Any = None, **kwargs: Any) -> dict[str, Any]:
+    """Adapter ekstraktor short-link checkout direct card.
+
+    Menjalankan ``direct_card/direct_card_extract.py`` (CLI mandiri) melalui
+    alur checkout AS / promo-update / verifikasi-jumlah-nol dan mengembalikan
+    link panjang ``chatgpt.com/checkout/<entity>/<cs_id>``-nya. Token akses dilewatkan
+    via file sementara ``--credential-file`` sehingga tidak pernah mencapai argv proses.
+    """
+    runtime_config = kwargs.pop("runtime_config", None)
+    root = _reference_root(runtime_config)
+    script = root / spec.script
+    if not script.is_file():
+        return {"ok": False, "error": f"protocol extractor not found: {script}"}
+
+    cfg = _protocol_cfg(runtime_config)
+    method_cfg = cfg.get("methods", {}).get(spec.key, {}) if isinstance(cfg.get("methods"), Mapping) else {}
+    if not isinstance(method_cfg, Mapping):
+        method_cfg = {}
+    timeout = int(method_cfg.get("timeout_seconds") or cfg.get("timeout_seconds") or 900)
+
+    checkout_proxy = str(
+        kwargs.get("checkout_proxy") or proxy or kwargs.get("provider_proxy") or ""
+    ).strip()
+    if not checkout_proxy:
+        return {"ok": False, "error": f"{spec.label} requires a checkout proxy seed"}
+    update_proxy = str(
+        kwargs.get("promotion_proxy") or kwargs.get("approve_proxy") or checkout_proxy or ""
+    ).strip()
+
+    country = str(kwargs.get("target_country") or kwargs.get("checkout_country") or spec.country or "PH").strip().upper()
+    currency = str(
+        method_cfg.get("currency")
+        or (spec.currency if country == spec.country else _DIRECT_CARD_CURRENCY.get(country, spec.currency))
+    ).strip().upper()
+    countries = kwargs.get("stage_proxy_countries") if isinstance(kwargs.get("stage_proxy_countries"), dict) else {}
+
+    env = os.environ.copy()
+    env["PYTHONUTF8"] = "1"
+    token_file = _write_token_file(access_token)
+    command = [
+        sys.executable, str(script),
+        "--credential-file", token_file,
+        "--billing-country", country,
+        "--currency", currency,
+        "--checkout-proxy", checkout_proxy,
+        "--update-proxy", update_proxy,
+        "--skip-proxy-check",
+    ]
+    checkout_cc = str(countries.get("checkout") or "").strip().upper()
+    update_cc = str(countries.get("promotion") or countries.get("update") or "").strip().upper()
+    if checkout_cc:
+        command.extend(["--checkout-proxy-country", checkout_cc])
+    if update_cc:
+        command.extend(["--update-proxy-country", update_cc])
+    promo = str(method_cfg.get("promo_campaign_id") or "").strip()
+    if promo:
+        command.extend(["--promo-campaign-id", promo])
+
+    proc, output, timeout_err = _run_extractor_subprocess(
+        spec, command, env=env, cwd=str(script.parent), timeout=timeout, cleanup_paths=(token_file,),
+    )
+    if timeout_err:
+        return timeout_err
+    parsed = _last_json_object(proc.stdout or "")
+    if not parsed:
+        return {
+            "ok": False,
+            "error": _redact_sensitive_text(_tail(output)) or f"extractor exited {proc.returncode}",
+            "exit_code": proc.returncode,
+        }
+    if not parsed.get("ok"):
+        return {
+            "ok": False,
+            "error": _redact_sensitive_text(str(parsed.get("error") or "direct_card extraction failed")),
+            "error_code": parsed.get("error_type") or "direct_card_failed",
+        }
+    long_url = str(parsed.get("long_url") or "").strip()
+    if not long_url:
+        return {"ok": False, "error": "direct_card extractor returned no checkout URL"}
+    return {
+        "ok": True,
+        "url": long_url,
+        "long_url": long_url,
+        "cs_id": parsed.get("cs_id") or "",
+        "processor_entity": parsed.get("processor_entity") or "",
+        "amount": parsed.get("amount_minor"),
+        "amount_verification": parsed.get("amount_verification") or "",
+        "currency": parsed.get("amount_currency") or currency,
+        "target_country": parsed.get("billing_country") or country,
+        "link_type": "direct_card_protocol",
+    }
+
+
+def _run_momo(spec: PaymentMethodSpec, access_token: str, proxy: Any = None, **kwargs: Any) -> dict[str, Any]:
+    """MoMo scannable-QR extractor adapter.
+
+    Drives ``momo/run_momo.py``, which wraps the VN checkout → Stripe init →
+    force ₫0 → MoMo PM → confirm → ChatGPT approve → follow-redirect flow and emits
+    a single normalized JSON object (``ok``/``url``/``qr_data``/``qr_path``/...). A
+    ``data:image`` QR is decoded to a PNG under ``runtime/momo_qr`` by the runner.
+    """
+    runtime_config = kwargs.pop("runtime_config", None)
+    root = _reference_root(runtime_config)
+    script = root / spec.script
+    if not script.is_file():
+        return {"ok": False, "error": f"protocol extractor not found: {script}"}
+
+    cfg = _protocol_cfg(runtime_config)
+    method_cfg = cfg.get("methods", {}).get(spec.key, {}) if isinstance(cfg.get("methods"), Mapping) else {}
+    if not isinstance(method_cfg, Mapping):
+        method_cfg = {}
+    timeout = int(method_cfg.get("timeout_seconds") or cfg.get("timeout_seconds") or 900)
+    request_timeout = int(method_cfg.get("request_timeout_seconds") or 25)
+    fallback_proxy = str(
+        kwargs.get("checkout_proxy") or proxy or kwargs.get("provider_proxy") or method_cfg.get("proxy") or ""
+    ).strip()
+    stage_proxies = {
+        "checkout": str(kwargs.get("checkout_proxy") or fallback_proxy).strip(),
+        "promotion": str(kwargs.get("promotion_proxy") or fallback_proxy).strip(),
+        "provider": str(
+            kwargs.get("provider_proxy") or kwargs.get("stripe_init_proxy") or fallback_proxy
+        ).strip(),
+        "approve": str(kwargs.get("approve_proxy") or fallback_proxy).strip(),
+        "redirect": str(kwargs.get("redirect_proxy") or fallback_proxy).strip(),
+    }
+    pre_proxy = str(method_cfg.get("pre_proxy") or "off").strip() or "off"
+    qr_dir = runtime_file(runtime_config or _config_data(), "momo_qr")
+
+    env = os.environ.copy()
+    env["PYTHONUTF8"] = "1"
+    token_file = _write_token_file(access_token)
+    command = [
+        sys.executable, str(script),
+        "--token-file", token_file,
+        "--pre-proxy", pre_proxy,
+        "--timeout", str(max(8, request_timeout)),
+        "--qr-out-dir", str(qr_dir),
+    ]
+    if fallback_proxy:
+        env["MOMO_PROXY"] = fallback_proxy
+    for stage, value in stage_proxies.items():
+        if value:
+            env[f"MOMO_{stage.upper()}_PROXY"] = value
+    strategy = str(kwargs.get("strategy") or method_cfg.get("strategy") or "custom_promo").strip()
+    if strategy:
+        command.extend(["--strategy", strategy])
+    if kwargs.get("probe_only"):
+        command.append("--probe-only")
+    stripe_profile = method_cfg.get("stripe_profile") if isinstance(method_cfg.get("stripe_profile"), Mapping) else {}
+    for env_key, config_key in {
+        "MOMO_STRIPE_RUNTIME_VERSION": "runtime_version",
+        "MOMO_STRIPE_API_VERSION": "api_version",
+        "MOMO_STRIPE_CLIENT_BETAS": "client_betas",
+        "MOMO_STRIPE_CONFIRM_FIELDS": "confirm_fields",
+    }.items():
+        value = stripe_profile.get(config_key)
+        if value not in (None, ""):
+            env[env_key] = json.dumps(value, ensure_ascii=False) if isinstance(value, (list, dict)) else str(value)
+    max_proxies = int(method_cfg.get("max_proxies") or 1)
+    if max_proxies > 1:
+        command.extend(["--max-proxies", str(max_proxies)])
+
+    proc, output, timeout_err = _run_extractor_subprocess(
+        spec, command, env=env, cwd=str(script.parent), timeout=timeout, cleanup_paths=(token_file,),
+    )
+    if timeout_err:
+        return timeout_err
+    parsed = _last_json_object(proc.stdout or "")
+    if not parsed:
+        return {
+            "ok": False,
+            "error": _redact_sensitive_text(_tail(output)) or f"extractor exited {proc.returncode}",
+            "exit_code": proc.returncode,
+        }
+    if not parsed.get("ok") and not parsed.get("error"):
+        parsed["error"] = parsed.get("qr_error") or parsed.get("decision_text") or "momo QR extraction failed"
+    return parsed
+
+
+def _normalize_result(spec: PaymentMethodSpec, result: Any) -> dict[str, Any]:
+    is_mapping = isinstance(result, dict)
+    data = dict(result) if is_mapping else {
+        "ok": False,
+        "error": str(result),
+        "error_code": "invalid_adapter_result",
+        "error_stage": "adapter_contract",
+    }
+    if is_mapping and not data and "ok" not in data:
+        data.update({
+            "ok": False,
+            "error": f"{spec.label} extractor returned an invalid result contract",
+            "error_code": "invalid_adapter_result",
+            "error_stage": "adapter_contract",
+        })
+    data.setdefault("payment_method", spec.key)
+    data.setdefault("method", spec.key)
+    data.setdefault("target_country", spec.country)
+    data.setdefault("currency", spec.currency)
+    data.setdefault("link_type", f"{spec.key}_protocol")
+    if not data.get("url"):
+        data["url"] = data.get("long_url") or data.get("provider_redirect_url") or data.get("checkout_url") or data.get("upi_uri") or ""
+    data.setdefault("operation", "extract_link")
+    completed_payment = (
+        spec.key == "blik"
+        and str(data.get("status") or "").lower() == "completed"
+        and data.get("operation") == "execute_payment"
+        and data.get("link_type") == "blik_protocol_completed"
+    )
+    explicit_terminal = _explicit_terminal_state(data)
+    if "ok" not in data:
+        data["ok"] = False
+        if not explicit_terminal:
+            data.setdefault("error", f"{spec.label} extractor returned an invalid result contract")
+            data.setdefault("error_code", "invalid_adapter_result")
+            data.setdefault("error_stage", "adapter_contract")
+    if explicit_terminal:
+        data["ok"] = False
+        data["status"] = explicit_terminal
+        if explicit_terminal == "unknown":
+            data.setdefault("requires_reconciliation", True)
+        data.setdefault("error_code", {
+            "cancelled": "payment_link_cancelled",
+            "unknown": "payment_outcome_unknown",
+            "timed_out": "payment_link_timed_out",
+        }[explicit_terminal])
+        data.setdefault("error", {
+            "cancelled": f"{spec.label} extraction was cancelled",
+            "unknown": f"{spec.label} extraction outcome is unknown",
+            "timed_out": f"{spec.label} extraction timed out",
+        }[explicit_terminal])
+    capability_probe = data.get("operation") == "payment_method_capability_probe"
+    if (
+        data.get("ok")
+        and not completed_payment
+        and not capability_probe
+        and not (data.get("url") or data.get("qr_data") or data.get("qr_path"))
+    ):
+        data["ok"] = False
+        data["error"] = f"{spec.label} extractor returned no link or QR data"
+        data["error_code"] = "adapter_result_missing_artifact"
+        data["error_stage"] = "normalization"
+    _normalize_error_contract(data)
+    if explicit_terminal == "cancelled" and data.get("error_code") == "payment_link_extraction_failed":
+        data["error_code"] = "payment_link_cancelled"
+    elif explicit_terminal == "timed_out" and data.get("error_code") == "payment_link_extraction_failed":
+        data["error_code"] = "payment_link_timed_out"
+    return data
+
+
+def _explicit_terminal_state(data: dict[str, Any]) -> str:
+    """Return a non-success terminal state explicitly reported by an adapter."""
+    if _as_bool(data.get("outcome_unknown")) is True or _as_bool(data.get("requires_reconciliation")) is True:
+        return "unknown"
+
+    for key in ("terminal_state", "state", "status", "outcome", "error_code", "error_type", "decision"):
+        state = _canonical_terminal_state(data.get(key))
+        if state:
+            return state
+
+    exit_code = data.get("exit_code")
+    try:
+        numeric_exit_code = int(exit_code)
+    except (TypeError, ValueError):
+        numeric_exit_code = 0
+    if numeric_exit_code in {124}:
+        return "timed_out"
+    if numeric_exit_code in {-2, 130, -1073741510, 3221225786}:
+        return "cancelled"
+
+    status = _normalized_contract_value(data.get("status") or data.get("state"))
+    has_artifact = bool(data.get("url") or data.get("qr_data") or data.get("qr_path"))
+    if not data.get("ok") and not has_artifact and status in {
+        "pending", "processing", "submitted", "requires_action", "awaiting_confirmation",
+    }:
+        return "unknown"
+    return ""
+
+
+def _canonical_terminal_state(value: Any) -> str:
+    normalized = _normalized_contract_value(value)
+    if normalized in {
+        "cancelled", "canceled", "cancelled_by_user", "canceled_by_user", "interrupted",
+        "keyboard_interrupt", "keyboardinterrupt",
+    } or normalized.endswith("_cancelled") or normalized.endswith("_canceled"):
+        return "cancelled"
+    if normalized in {"timed_out", "timeout", "timeout_expired", "extractor_timeout"} or (
+        normalized.endswith("_timed_out") or normalized.endswith("_timeout")
+    ):
+        return "timed_out"
+    if normalized in {"unknown", "outcome_unknown", "payment_outcome_unknown", "indeterminate", "inconclusive"} or (
+        normalized.endswith("_outcome_unknown")
+    ):
+        return "unknown"
+    return ""
+
+
+def _normalized_contract_value(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    return re.sub(r"[^a-z0-9]+", "_", value.strip().lower()).strip("_")
+
+
+def _normalize_error_contract(data: dict[str, Any]) -> None:
+    """Ensure every adapter result has stable retry and error-stage fields."""
+    if data.get("ok"):
+        data["retryable"] = False
+        data["error_stage"] = ""
+        return
+
+    terminal_state = _explicit_terminal_state(data) or "failed"
+    stage = data.get("error_stage") or data.get("stage") or data.get("failed_step")
+    data["error_stage"] = str(stage or ("adapter_contract" if data.get("error_code") == "invalid_adapter_result" else "adapter")).strip() or "adapter"
+    data.setdefault("error", "payment-link extraction failed")
+    data.setdefault("error_code", "payment_link_extraction_failed")
+
+    explicit_retryable = _as_bool(data.get("retryable"))
+    if explicit_retryable is None:
+        explicit_retryable = _as_bool(data.get("retry_safe"))
+    if terminal_state in {"cancelled", "unknown"}:
+        data["retryable"] = False
+    elif explicit_retryable is not None:
+        data["retryable"] = explicit_retryable
+    elif terminal_state == "timed_out":
+        data["retryable"] = True
+    else:
+        data["retryable"] = _is_retryable_failure(data)
+
+
+def _as_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value in {0, 1}:
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "y"}:
+            return True
+        if normalized in {"0", "false", "no", "n"}:
+            return False
+    return None
+
+
+def _is_retryable_failure(data: dict[str, Any]) -> bool:
+    try:
+        status_code = int(data.get("status_code") or data.get("http_status") or 0)
+    except (TypeError, ValueError):
+        status_code = 0
+    if status_code == 429 or 500 <= status_code <= 599:
+        return True
+    code = _normalized_contract_value(data.get("error_code") or data.get("error_type"))
+    retryable_codes = {
+        "connection_error", "connect_timeout", "read_timeout", "network_error",
+        "proxy_error", "proxy_unavailable", "rate_limited", "service_unavailable",
+    }
+    return code in retryable_codes
+
+
+def _result_terminal_state(data: dict[str, Any]) -> str:
+    return "completed" if data.get("ok") else (_explicit_terminal_state(data) or "failed")
+
+
+def _classify_exception(exc: Exception) -> tuple[str, str, bool]:
+    explicit_state = _canonical_terminal_state(
+        getattr(exc, "status", "") or getattr(exc, "terminal_state", "")
+    )
+    custom_code = str(
+        getattr(exc, "error_code", "")
+        or getattr(exc, "code", "")
+        or ""
+    )
+    if explicit_state:
+        default_code = {
+            "cancelled": "payment_link_cancelled",
+            "unknown": "payment_outcome_unknown",
+            "timed_out": "payment_link_timed_out",
+        }[explicit_state]
+        explicit_retryable = _as_bool(getattr(exc, "retryable", None))
+        if explicit_state in {"cancelled", "unknown"}:
+            explicit_retryable = False
+        elif explicit_retryable is None:
+            explicit_retryable = explicit_state == "timed_out"
+        return explicit_state, custom_code or default_code, bool(explicit_retryable)
+    if _as_bool(getattr(exc, "outcome_unknown", None)) is True:
+        return "unknown", custom_code or "payment_outcome_unknown", False
+    names = {_normalized_contract_value(cls.__name__) for cls in type(exc).mro()}
+    if names & {"cancellederror", "cancelled_error", "canceled_error"}:
+        return "cancelled", "payment_link_cancelled", False
+    if isinstance(exc, (subprocess.TimeoutExpired, TimeoutError)) or any("timeout" in name for name in names):
+        return "timed_out", "payment_link_timed_out", True
+    retryable = _as_bool(getattr(exc, "retryable", None)) is True
+    return "failed", custom_code or "payment_link_manager_failed", retryable
+
+
+def _manager_error_stage(state: str) -> str:
+    return {
+        "created": "validation",
+        "validating": "validation",
+        "preparing_proxy": "proxy_setup",
+        "running": "adapter",
+        "extracting": "normalization",
+    }.get(state, "manager")
+
+
+def _select_kwargs(values: dict[str, Any], allowed: set[str]) -> dict[str, Any]:
+    return {key: value for key, value in values.items() if key in allowed and value is not None}
+
+
+def _protocol_cfg(runtime_config: Mapping[str, Any] | None = None) -> Mapping[str, Any]:
+    source = _config_data(runtime_config)
+    value = source.get("protocol_payments")
+    return value if isinstance(value, Mapping) else {}
+
+
+def _enabled_methods(runtime_config: Mapping[str, Any] | None = None) -> set[str]:
+    raw = _protocol_cfg(runtime_config).get("enabled_methods")
+    if isinstance(raw, str):
+        values = re.split(r"[,;\s]+", raw)
+    elif isinstance(raw, (list, tuple, set)):
+        values = list(raw)
+    else:
+        return set(PAYMENT_METHODS)
+    return {method for value in values if (method := normalize_payment_method(value))}
+
+
+def _reference_root(runtime_config: Mapping[str, Any] | None = None) -> Path:
+    configured = _protocol_cfg(runtime_config).get("reference_root") or "services/protocol-payment"
+    return project_path(configured)
+
+
+def _state_path() -> Path:
+    configured = str(_protocol_cfg().get("state_file") or "").strip()
+    return project_path(configured) if configured else runtime_file(_config_data(), "payment_link_runs.jsonl")
+
+
+def _persist_run(result: dict[str, Any]) -> None:
+    path = _state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    record = {}
+    for key, value in result.items():
+        lowered = key.lower()
+        # Daftar hitam key: output subproses mentah, token, proxy diketahui tidak boleh disimpan ke disk;
+        # card_* / card_last4 / pan juga merupakan kredensial sensitif — jalur pembayaran browser
+        # akan memasukkan empat digit terakhir nomor kartu ke dict kembalian, di sini dicegat berdasarkan nama key, hindari masuk jsonl.
+        if (
+            lowered in {"raw_output", "raw_output_tail"}
+            or "token" in lowered
+            or "proxy" in lowered
+            or lowered.startswith("card_")
+            or lowered in {"card", "pan", "cardnumber", "card_number"}
+        ):
+            continue
+        record[key] = _redact_sensitive_values(value)
+    with _STATE_LOCK:
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+
+
+def _safe_persist_run(result: dict[str, Any]) -> None:
+    try:
+        _persist_run(result)
+    except Exception as exc:
+        result["persistence_warning"] = f"payment run state was not persisted: {type(exc).__name__}"
+
+
+def _last_json_object(text: str) -> dict[str, Any]:
+    decoder = json.JSONDecoder()
+    for index in reversed([i for i, char in enumerate(text) if char == "{"]):
+        try:
+            value, end = decoder.raw_decode(text[index:])
+        except Exception:
+            continue
+        if isinstance(value, dict) and not text[index + end :].strip():
+            return value
+    return {}
+
+
+def _last_payment_url(text: str) -> str:
+    labeled = [match.group(1).rstrip(".,);]") for match in _RESULT_URL_RE.finditer(text or "")]
+    if labeled:
+        return labeled[-1]
+    urls = [match.group(0).rstrip(".,);]") for match in _URL_RE.finditer(text or "")]
+    ignored = ("api.stripe.com", "chatgpt.com/backend-api", "ipinfo.io", "ip-api.com")
+    candidates = [url for url in urls if not any(marker in url.lower() for marker in ignored)]
+    return candidates[-1] if candidates else ""
+
+
+def _tail(text: str, limit: int = 1200) -> str:
+    value = str(text or "").strip()
+    return value[-limit:]
+
+
+def _blik_completion(stdout: str) -> dict[str, Any]:
+    """Parse the sentinel penyelesaian auto-submit BLIK dari stdout.
+
+    Mode auto-submit BLIK tidak memiliki URL yang dapat dibagikan setelah pembayaran selesai, sinyal keberhasilannya adalah baris terstruktur ``BLIK_RESULT:{...}`` yang dicetak oleh
+    ``print_result_url`` (status=completed). Mengembalikan sentinel penyelesaian terakhir, jika tidak, dict kosong.
+    """
+    for raw in reversed(_BLIK_RESULT_RE.findall(stdout or "")):
+        try:
+            value = json.loads(raw)
+        except Exception:
+            continue
+        if (
+            isinstance(value, dict)
+            and value.get("ok") is True
+            and str(value.get("payment_method") or "").lower() == "blik"
+            and str(value.get("status") or "").lower() == "completed"
+            and value.get("link_type") == "blik_protocol_completed"
+        ):
+            return value
+    return {}
+
+
+def _mask_ba_token(token: str) -> str:
+    return "[REDACTED]" if token else ""
+
+
+def _redact_sensitive_text(value: str) -> str:
+    return _canonical_sanitize_text(value)
+
+
+def _redact_sensitive_values(value: Any) -> Any:
+    """Sembunyikan kredensial di mana saja di dalam nilai persisted payment-run.
+
+    Kunci ``ba_token`` sendiri telah dibuang oleh filter nama kunci di :func:`_persist_run`, tetapi URL persetujuan
+    (misal ``.../agreements/approve?ba_token=BA-...``) akan disimpan di bidang ``url``/``fallback_url``,
+    perlu disamarkan nilainya sebelum disimpan. Log dan teks error mungkin juga mengandung Bearer/JWT, autentikasi proxy, atau
+    kredensial bernama lainnya, oleh karena itu dibersihkan secara rekursif secara seragam. Hanya memengaruhi catatan yang dipersistensikan, tidak mengubah hasil yang dikembalikan ke pemanggil.
+    """
+    return _canonical_sanitize(value)

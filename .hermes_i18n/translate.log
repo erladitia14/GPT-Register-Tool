@@ -1,0 +1,27 @@
+total=1421 done=372 remaining=1049 model=kr/deepseek-3.2
+batches: 41
+  batch 6 attempt 0 failed: length mismatch 1 != 2
+  batch 8 attempt 0 failed: length mismatch 53 != 2
+  batch 8 attempt 1 failed: length mismatch 68 != 2
+progress: 10/41 batches, 429 strings done
+  batch 10 attempt 0 failed: Expecting value: line 1 column 6 (char 5)
+  batch 10 attempt 1 failed: Expecting ',' delimiter: line 1 column 6 (char 5)
+  batch 10 attempt 2 failed: Expecting ',' delimiter: line 1 column 6 (char 5)
+  batch 10 FAILED permanently, kept original
+  batch 19 attempt 0 failed: length mismatch 43 != 1
+  batch 19 attempt 1 failed: length mismatch 42 != 1
+  batch 19 attempt 2 failed: length mismatch 44 != 1
+  batch 19 FAILED permanently, kept original
+progress: 20/41 batches, 682 strings done
+  batch 21 attempt 0 failed: length mismatch 70 != 2
+  batch 21 attempt 1 failed: Unterminated string starting at: line 1 column 2 (char 1)
+  batch 21 attempt 2 failed: length mismatch 1 != 2
+  batch 21 FAILED permanently, kept original
+  batch 25 attempt 0 failed: length mismatch 2 != 5
+  batch 25 attempt 1 failed: Expecting ',' delimiter: line 5 column 141 (char 3104)
+  batch 25 attempt 2 failed: Extra data: line 3 column 5 (char 2210)
+  batch 25 FAILED permanently, kept original
+progress: 30/41 batches, 708 strings done
+progress: 40/41 batches, 1320 strings done
+progress: 41/41 batches, 1421 strings done
+COMPLETE. translated=1421 failed_batches=4
