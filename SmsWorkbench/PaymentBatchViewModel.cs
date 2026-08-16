@@ -189,7 +189,7 @@ namespace SmsWorkbench
             }
             if (MatrixRows.Any(cell => !cell.IsValid()))
             {
-                Status = "Kode negara matriks harus kosong atau dua huruf, jumlah sampel harus lebih besar dari 0.";
+                Status = "Kode negara matriks harus kosong atau Dua huruf, jumlah sampel harus lebih besar dari 0.";
                 return false;
             }
             BatchId = normalizedBatchId;

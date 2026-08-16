@@ -87,15 +87,15 @@ namespace SmsWorkbench
             if (method == "blik")
             {
                 return new ProtocolPaymentExecutionPlan(
-                    methodLabel + " pembayaran protokol",
+                    methodLabel + " Pembayaran Protokol",
                     "Menjalankan " + methodLabel + " pembayaran protokol...",
                     arguments,
                     "execute_payment",
                     true);
             }
             return new ProtocolPaymentExecutionPlan(
-                methodLabel + " ekstraksi chain protokol",
-                "Menjalankan " + methodLabel + " ekstraksi chain protokol...",
+                "Ekstraksi tautan protokol " + methodLabel,
+                "Menjalankan ekstraksi tautan protokol " + methodLabel + "...",
                 arguments,
                 "extract_link",
                 mayHaveSideEffects);
@@ -291,7 +291,7 @@ namespace SmsWorkbench
             if (operation.Length > 0)
                 text += $"\nAksi yang dijalankan: {operation}";
             if (requiresReconciliation)
-                text += "\nPerlu rekonsiliasi: permintaan mungkin telah mencapai layanan pembayaran.";
+                text += "\nPerlu rekonsiliasi: permintaan mungkin telah mencapai layanan pembayaran. Jangan ulangi operasi ini sebelum status diverifikasi.";
             return new ProtocolPaymentResultPresentation(
                 text,
                 "",
@@ -323,12 +323,12 @@ namespace SmsWorkbench
                 _ => "[Gagal]"
             };
             string text = $"{prefix} {error}".TrimEnd()
-                + (errorCode.Length == 0 ? "" : $"\nKode galat: {errorCode}");
+                + (errorCode.Length == 0 ? "" : $"\nKode Error: {errorCode}");
             string errorStage = StringValue(root, "error_stage");
             if (errorStage.Length > 0)
                 text += $"\nTahap galat: {errorStage}";
             if (requiresReconciliation)
-                text += "\nPerlu rekonsiliasi: permintaan mungkin telah mencapai layanan pembayaran.";
+                text += "\nPerlu rekonsiliasi: permintaan mungkin telah mencapai layanan pembayaran. Jangan ulangi operasi ini sebelum status diverifikasi.";
             else if (retryable)
                 text += "\nDapat dicoba ulang: Ya";
             return new ProtocolPaymentResultPresentation(
